@@ -1,10 +1,19 @@
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
+import pandas as pd
+import pickle
 import numpy as np
 import os
+import cv2
 import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
+import gymnasium as gym
+import lightning as pl
+from collections import deque
+from transformers import BertTokenizer, BertModel
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics.pairwise import cosine_similarity
 
 from stable_baselines3.common.buffers import ReplayBuffer, DictReplayBuffer
 from stable_baselines3.common.callbacks import BaseCallback
@@ -14,6 +23,7 @@ from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn, Schedule, TrainFreq, TrainFrequencyUnit
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
 from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
+from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 from stable_baselines3.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
@@ -362,23 +372,44 @@ class SACMaster(SAC):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
-        load_subpolicies: bool = True,
-        sub_policies_path: Optional[str] = None,
-        weighting_scheme: str = "classic",
+        policy_dir : str = None,
+        experience_dir: str = None,
+        descriptions_dir: str = None,
+        ae_model: pl.LightningModule = None,
+        task_description: str = None,
+        tokenizer_str: str = None,
+        similarity_thr: float = 0.5,
+        k: int = 5
     ):
-        if load_subpolicies:
-            self.n_subpolicies = spaces.Box(0,1, [len(os.listdir(sub_policies_path))])
-            policy_kwargs = {} if policy_kwargs is None else policy_kwargs
-            policy_kwargs.update({
-                        "load_subpolicies": load_subpolicies,
-                        "sub_policies_path": sub_policies_path,
-                        "master_action_space": self.n_subpolicies,
-                        "weighting_scheme": weighting_scheme,
-            })
-            # policy_kwargs[] = load_subpolicies
-            # policy_kwargs[] = sub_policies_path
-            # policy_kwargs[] = self.n_subpolicies
-            # policy_kwargs["weighting_scheme"] = weighting_scheme
+
+        self.device = device
+        self.tokenizer_str = tokenizer_str
+        self.ae_model = ae_model
+        self.task_description = task_description
+        self.similarity_thr = similarity_thr
+        self.k = k
+        self.count = 0
+        self.source_policy = None
+
+        self.ae_model.to(self.device)
+
+        self.frames_queue = deque(maxlen=4)
+
+        if experience_dir is None or policy_dir is None or descriptions_dir is None:
+            raise ValueError("Experience dir or Policy dir or Descriptions dir not defined")
+        
+        if ae_model is None:
+            raise ValueError("Ae model not defined")
+
+        if task_description is not None and tokenizer_str is None:
+            raise ValueError("Tokenizer not defined")
+        elif task_description is None and tokenizer_str is not None:
+            raise ValueError("Task description not defined")
+        elif task_description is not None and tokenizer_str is not None:
+            self.task_description = self._get_description_cls(self.task_description)
+
+        self.policies_pool = self._load_source_policies(policy_dir)
+        self.source_experience = self._load_source_experience(experience_dir, descriptions_dir)
         
         super().__init__(
             policy,
@@ -410,66 +441,51 @@ class SACMaster(SAC):
             _init_setup_model,
         )
     
-    def _setup_model(self) -> None:
-        if self.replay_buffer_class is None:
-            if isinstance(self.observation_space, spaces.Dict):
-                self.replay_buffer_class = DictReplayBuffer
-            else:
-                self.replay_buffer_class = ReplayBuffer
-        if self.replay_buffer is None:
-            # Make a local copy as we should not pickle
-            # the environment when using HerReplayBuffer
-            replay_buffer_kwargs = self.replay_buffer_kwargs.copy()
-            if issubclass(self.replay_buffer_class, HerReplayBuffer):
-                assert self.env is not None, "You must pass an environment when using `HerReplayBuffer`"
-                replay_buffer_kwargs["env"] = self.env
-            self.replay_buffer = self.replay_buffer_class(
-                self.buffer_size,
-                self.observation_space,
-                self.n_subpolicies,
-                device=self.device,
-                n_envs=self.n_envs,
-                optimize_memory_usage=self.optimize_memory_usage,
-                **replay_buffer_kwargs,
-            )
-        return super()._setup_model()
-    
     def _sample_action(
         self,
         learning_starts: int,
         action_noise: Optional[ActionNoise] = None,
         n_envs: int = 1,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        # Select action randomly or according to policy
+
         if self.num_timesteps < learning_starts and not (self.use_sde and self.use_sde_at_warmup):
             # Warmup phase
-            weights = np.random.random([np.prod(self.n_subpolicies.shape), n_envs])
-            pool_out = self.policy.get_pool_out(self._last_obs)
-            unscaled_action = self.policy.weighted_action(pool_out, weights)
-            unscaled_action = unscaled_action.cpu().numpy()
+            unscaled_action = np.array([self.action_space.sample() for _ in range(n_envs)])
         else:
             # Note: when using continuous actions,
             # we assume that the policy uses tanh to scale the action
             # We use non-deterministic action in the case of SAC, for TD3, it does not matter
             assert self._last_obs is not None, "self._last_obs was not set"
-            unscaled_action, weights, _ = self.predict(self._last_obs, deterministic=False)
 
-        action = unscaled_action
+            if self.count == self.k:
+                self.source_policy = self._select_best_source_policy()
+                self.count = 0
+            else:
+                self.count += 1
+
+            if self.source_policy is None:
+                unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
+            else:
+                obs = th.tensor(self._last_obs)
+                unscaled_action = self.policy(obs, deterministic=True)
+                unscaled_action = unscaled_action.detach().numpy() 
+
         # Rescale the action from [low, high] to [-1, 1]
-        # if isinstance(self.action_space, spaces.Box):
-        #     scaled_action = self.policy.scale_action(unscaled_action)
-        #     # Add noise to the action (improve exploration)
-        #     if action_noise is not None:
-        #         scaled_action = np.clip(scaled_action + action_noise(), -1, 1)
+        if isinstance(self.action_space, spaces.Box):
+            scaled_action = self.policy.scale_action(unscaled_action)
 
-        #     # We store the scaled action in the buffer
-        #     buffer_action = scaled_action
-        #     action = self.policy.unscale_action(scaled_action)
-        # else:
-        #     # Discrete case, no need to normalize or clip
-        #     buffer_action = unscaled_action
-        #     action = buffer_action
-        return action, weights
+            # Add noise to the action (improve exploration)
+            if action_noise is not None:
+                scaled_action = np.clip(scaled_action + action_noise(), -1, 1)
+
+            # We store the scaled action in the buffer
+            buffer_action = scaled_action
+            action = self.policy.unscale_action(scaled_action)
+        else:
+            # Discrete case, no need to normalize or clip
+            buffer_action = unscaled_action
+            action = buffer_action
+        return action, buffer_action
     
     def _dump_logs(self) -> None:
         
@@ -532,6 +548,15 @@ class SACMaster(SAC):
             # Rescale and perform action
             new_obs, rewards, dones, infos = env.step(actions)
 
+            # Get a frame from the environment
+            frame = env.render()
+            # Reshape frame
+            np_frame = np.array(frame, dtype=np.uint8)
+            np_frame = np_frame.reshape(3, 600, 600)
+            # Cast from RGB to GRAYSCALE
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            self.frames_queue.append(frame)
+
             self.num_timesteps += env.num_envs
             num_collected_steps += 1
 
@@ -571,3 +596,239 @@ class SACMaster(SAC):
         callback.on_rollout_end()
 
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
+
+    def _get_description_cls(self, description):
+
+        tokenizer = BertTokenizer.from_pretrained(self.tokenizer_str)
+        tokens = tokenizer(description, padding=True, truncation=True, return_tensors='pt', max_length=256)
+        model = BertModel.from_pretrained(self.tokenizer_str)
+        with th.no_grad():
+            outputs = model(**tokens)
+            embeddings = outputs.last_hidden_state[:, 0, :].numpy()  # Use [CLS] token embeddings
+        cls_token = np.squeeze(embeddings)
+
+        return cls_token
+
+    def _get_env_name(self, name):
+
+        if name == "intersection":
+            return f'{name}-v1'
+        else:
+            if name == "lane":
+                name = f'{name}-centering'
+            return f'{name}-v0'
+        
+    def _apply_upsampling(self, image):
+        
+        # Dimensions of the original image
+        original_height, original_width = image.shape
+
+        # New dimensions
+        new_height, new_width = 600, 600
+        diff_height = new_height - original_height
+        diff_width = new_width - original_width
+
+        # Calculate the padding sizes for height and width
+        top_pad = (new_height - original_height) // 2
+        bottom_pad = new_height - original_height - top_pad
+        left_pad = (new_width - original_width) // 2
+        right_pad = new_width - original_width - left_pad
+        
+        background_color = 100
+
+        # Create a new larger matrix filled with the padding value
+        larger_matrix = np.full((new_height, new_width), background_color, dtype=image.dtype)
+        
+        # Copy the original image into the center of the larger matrix
+        larger_matrix[top_pad:top_pad + original_height, left_pad:left_pad + original_width] = image
+
+        return larger_matrix
+    
+    def _upsample_observations(self, x):
+
+        vec_tmp = np.array(x)
+        res = []
+        if vec_tmp.shape[1] != 600 or vec_tmp.shape[2] != 600:
+            for i in range(vec_tmp.shape[0]):
+                res.append(self._apply_upsampling(vec_tmp[i]))
+        else:
+            res = x
+        
+        return res
+    
+    def _frame_to_embedding(self, x):
+        
+        images = np.array([x])
+        images = th.from_numpy(images)
+        images = images.to(th.float)
+
+        images.to(th.device(self.device))
+        self.ae_model.eval()
+
+        # Make predictions
+        with th.no_grad():
+            res = self.ae_model(images, return_encodings=True)
+
+        return np.squeeze(res.numpy())
+
+    def _load_source_policies(self, policy_directory):
+
+        KINEMATICS_OBSERVATION = {
+            "type": "Kinematics",
+            "vehicles_count": 5,
+            "features": ["presence", "x", "y", "vx", "vy", "heading", "long_off", "lat_off", "ang_off"],
+            "absolute": False,
+            "order": "sorted",
+        }
+
+        config = {
+            "observation": KINEMATICS_OBSERVATION,
+            "action": {
+                "type": "ContinuousAction",
+            },
+            "policy_frequency": 5, 
+            "vehicles_count": 5,
+            # "real_time_rendering":True,
+        }
+
+        policy_dict = {}
+        files = os.listdir(policy_directory)
+        for file in files:
+
+            tokens = file.split('_')
+            name = tokens[0]
+
+            env_name = self._get_env_name(name)
+            env = gym.make(env_name, config=config, render_mode="rgb_array")
+
+            obs_space = env.observation_space
+
+            if env_name == "lane-centering-v0":
+                obs_space = spaces.Box(-np.inf, np.inf, (1,9), dtype = np.float32)
+
+            scheduler = get_schedule_fn(0.1)
+            policy = SACPolicy(obs_space, env.action_space, scheduler)
+            policy.load_state_dict(th.load(f'{policy_directory}/{file}', map_location=th.device(self.device)))
+            
+            policy_dict[env_name] = policy
+
+            env.close()
+
+            print(f"{env_name} policy loaded!")
+
+        return policy_dict
+
+    def _load_source_experience(self, experience_directory, source_descriptions_dir, n_rows=10):
+
+        files = os.listdir(experience_directory)
+
+        df_descriptions = pd.read_json(source_descriptions_dir)
+
+        df = None
+        for file in files:
+
+            with open(f'{experience_directory}/{file}', 'rb') as f:
+                data = pickle.load(f)
+
+            tokens = file.split('_')
+            name = tokens[0]
+
+            env_name = self._get_env_name(name)
+            env_df = pd.DataFrame(data)
+
+            # Get the environment description
+            df_filtered = df_descriptions[df_descriptions['env_name'] == env_name]
+            description = df_filtered['description'].iloc[0]
+            if self.tokenizer_str is not None:
+                description = self._get_description_cls(description)
+
+            env_df['Description'] = [description] * len(env_df['Observation'])
+            env_df['Env_name'] = [env_name] * len(env_df['Observation'])
+
+            # Sort rows by the total reward and take the first n_rows
+            env_df['Sum'] = env_df['Reward'].apply(np.sum)
+            env_df = env_df.sort_values(by='Sum', ascending=False)
+            env_df = env_df.head(n_rows)
+            env_df = env_df.drop(columns=['Sum'])
+
+            if df is None:
+                df = env_df
+            else:
+                df = pd.concat([df, env_df], ignore_index=True)
+
+        
+        # Apply upsampling for the frames with a size smaller than 600x600
+        df['Observation'] = df['Observation'].apply(self._upsample_observations)
+        df['Observation'] = df['Observation'].apply(self._frame_to_embedding)
+        print("Source experience loaded")
+
+        return df
+
+    def _apply_minmax(self, data, column):
+        
+        scaler = MinMaxScaler()
+        data[column] = scaler.fit_transform(data[column].to_list()).tolist()
+
+        return data
+        
+    def _compute_cosine(self, task_exp, source_exp):
+
+        task_exp = np.array(task_exp)
+        task_exp = task_exp.reshape(1, -1)
+
+        source_exp = np.array(source_exp)
+
+        res = cosine_similarity(source_exp, task_exp)
+
+        return res.mean()
+    
+    def _concatenate_arrays(self, arr1, arr2):
+        return np.concatenate((arr1, arr2))
+
+    def _select_best_source_policy(self):
+
+        # Reverses the list so that the frames are ordered from oldest to newest
+        task_frames = list(reversed(self.frames_queue))
+        # Cast frames into an embedding
+        task_data = self._frame_to_embedding(task_frames)
+
+        data = self.source_experience.copy(deep=True)
+        data = data[['Observation', 'Description', 'Env_name']]
+
+        # Add task experience to the experience dataframe
+        new_row = {'Observation': task_data,
+                    'Description': self.task_description,
+                    'Env_name': 'target_task'}
+        
+        data.loc[len(data)] = new_row
+        
+        # Select the columns to use and apply MinMax scaling
+        if self.task_description is not None:
+            column = 'Concatenated'
+            data[column] = data.apply(lambda row: self._concatenate_arrays(row['Observation'], row['Description']), axis=1)
+            data = self._apply_minmax(data, column)
+        else:
+            column = 'Observation'
+            data = self._apply_minmax(data, column)
+
+        # Compute cosine between task data and each source data
+        source_envs = list(self.policies_pool.keys())
+        res = []
+        for source_env in source_envs:
+            env_data = data[data['Env_name'] == source_env][column]
+            task_data = data[data['Env_name'] == 'target_task'][column]
+            env_data = env_data.values.tolist()
+            task_data = task_data.values.tolist()
+            res.append(self._compute_cosine(task_data, env_data))
+        
+        # TODO if the maximum value is more than one, pick the max value index randomly
+        # Find the max score
+        max_value = max(res)
+
+        # Returns a source policy if the score is over the threshold otherwise returns None
+        if max_value >= self.similarity_thr:
+            max_index = res.index(max_value)
+            sim_env_name = source_envs[max_index]
+            return self.policies_pool.get(sim_env_name)
+        else:
+            return None
