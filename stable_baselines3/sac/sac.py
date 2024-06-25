@@ -391,8 +391,6 @@ class SACMaster(SAC):
         self.count = 0
         self.source_policy = None
 
-        self.count_usage = 0
-
         if k is not None:
             self.ae_model.to(self.device)
 
@@ -412,6 +410,8 @@ class SACMaster(SAC):
                 self.task_description = self._get_description_cls(self.task_description)
 
             self.policies_pool = self._load_source_policies(policy_dir)
+            self.count_source_policies = [0] * len(self.policies_pool)
+
             self.source_experience = self._load_source_experience(experience_dir, descriptions_dir)
         
         super().__init__(
@@ -462,12 +462,11 @@ class SACMaster(SAC):
 
             if self.k is not None:
                 if self.count == self.k:
-                    self.source_policy = self._select_best_source_policy()
+                    self.source_policy, policy_idx = self._select_best_source_policy()
                     self.count = 0
 
-                    #TEST
                     if self.source_policy is not None:
-                        self.count_usage += 1
+                        self.count_source_policies[policy_idx] += 1
                 else:
                     self.count += 1
 
@@ -561,7 +560,7 @@ class SACMaster(SAC):
 
             if self.k is not None:
                 # Get a frame from the environment
-                frame = env.render()
+                frame = env.get_images()[-1]
                 # Reshape frame
                 np_frame = np.array(frame, dtype=np.uint8)
                 np_frame = np_frame.reshape(3, 600, 600)
@@ -841,6 +840,6 @@ class SACMaster(SAC):
         if max_value >= self.similarity_thr:
             max_index = res.index(max_value)
             sim_env_name = source_envs[max_index]
-            return self.policies_pool.get(sim_env_name)
+            return self.policies_pool.get(sim_env_name), max_index
         else:
             return None
