@@ -379,7 +379,7 @@ class SACMaster(SAC):
         task_description: str = None,
         tokenizer_str: str = None,
         similarity_thr: float = 0.5,
-        k: int = 5
+        k: int = None
     ):
 
         self.device = device
@@ -391,25 +391,28 @@ class SACMaster(SAC):
         self.count = 0
         self.source_policy = None
 
-        self.ae_model.to(self.device)
+        self.count_usage = 0
 
-        self.frames_queue = deque(maxlen=4)
+        if k is not None:
+            self.ae_model.to(self.device)
 
-        if experience_dir is None or policy_dir is None or descriptions_dir is None:
-            raise ValueError("Experience dir or Policy dir or Descriptions dir not defined")
-        
-        if ae_model is None:
-            raise ValueError("Ae model not defined")
+            self.frames_queue = deque(maxlen=4)
 
-        if task_description is not None and tokenizer_str is None:
-            raise ValueError("Tokenizer not defined")
-        elif task_description is None and tokenizer_str is not None:
-            raise ValueError("Task description not defined")
-        elif task_description is not None and tokenizer_str is not None:
-            self.task_description = self._get_description_cls(self.task_description)
+            if experience_dir is None or policy_dir is None or descriptions_dir is None:
+                raise ValueError("Experience dir or Policy dir or Descriptions dir not defined")
+            
+            if ae_model is None:
+                raise ValueError("Ae model not defined")
 
-        self.policies_pool = self._load_source_policies(policy_dir)
-        self.source_experience = self._load_source_experience(experience_dir, descriptions_dir)
+            if task_description is not None and tokenizer_str is None:
+                raise ValueError("Tokenizer not defined")
+            elif task_description is None and tokenizer_str is not None:
+                raise ValueError("Task description not defined")
+            elif task_description is not None and tokenizer_str is not None:
+                self.task_description = self._get_description_cls(self.task_description)
+
+            self.policies_pool = self._load_source_policies(policy_dir)
+            self.source_experience = self._load_source_experience(experience_dir, descriptions_dir)
         
         super().__init__(
             policy,
@@ -457,18 +460,26 @@ class SACMaster(SAC):
             # We use non-deterministic action in the case of SAC, for TD3, it does not matter
             assert self._last_obs is not None, "self._last_obs was not set"
 
-            if self.count == self.k:
-                self.source_policy = self._select_best_source_policy()
-                self.count = 0
-            else:
-                self.count += 1
+            if self.k is not None:
+                if self.count == self.k:
+                    self.source_policy = self._select_best_source_policy()
+                    self.count = 0
 
-            if self.source_policy is None:
-                unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
+                    #TEST
+                    if self.source_policy is not None:
+                        self.count_usage += 1
+                else:
+                    self.count += 1
+
+                if self.source_policy is None:
+                    unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
+                else:
+                    obs = th.tensor(self._last_obs).to(self.device)
+                    unscaled_action = self.policy(obs, deterministic=True)
+
+                    unscaled_action = unscaled_action.cpu().detach().numpy()
             else:
-                obs = th.tensor(self._last_obs)
-                unscaled_action = self.policy(obs, deterministic=True)
-                unscaled_action = unscaled_action.detach().numpy() 
+                unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
 
         # Rescale the action from [low, high] to [-1, 1]
         if isinstance(self.action_space, spaces.Box):
@@ -548,14 +559,15 @@ class SACMaster(SAC):
             # Rescale and perform action
             new_obs, rewards, dones, infos = env.step(actions)
 
-            # Get a frame from the environment
-            frame = env.render()
-            # Reshape frame
-            np_frame = np.array(frame, dtype=np.uint8)
-            np_frame = np_frame.reshape(3, 600, 600)
-            # Cast from RGB to GRAYSCALE
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            self.frames_queue.append(frame)
+            if self.k is not None:
+                # Get a frame from the environment
+                frame = env.render()
+                # Reshape frame
+                np_frame = np.array(frame, dtype=np.uint8)
+                np_frame = np_frame.reshape(3, 600, 600)
+                # Cast from RGB to GRAYSCALE
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                self.frames_queue.append(frame)
 
             self.num_timesteps += env.num_envs
             num_collected_steps += 1
@@ -662,14 +674,14 @@ class SACMaster(SAC):
         images = th.from_numpy(images)
         images = images.to(th.float)
 
-        images.to(th.device(self.device))
+        images = images.to(th.device(self.device))
         self.ae_model.eval()
 
         # Make predictions
         with th.no_grad():
             res = self.ae_model(images, return_encodings=True)
 
-        return np.squeeze(res.numpy())
+        return np.squeeze(res.cpu().numpy())
 
     def _load_source_policies(self, policy_directory):
 
