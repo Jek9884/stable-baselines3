@@ -559,14 +559,16 @@ class SACMaster(SAC):
             new_obs, rewards, dones, infos = env.step(actions)
 
             if self.k is not None:
-                # Get a frame from the environment
-                frame = env.get_images()[-1]
-                # Reshape frame
-                np_frame = np.array(frame, dtype=np.uint8)
-                np_frame = np_frame.reshape(3, 600, 600)
-                # Cast from RGB to GRAYSCALE
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                self.frames_queue.append(frame)
+                if self.count == self.k:
+                    # Get a frame from the environment
+                    frames = env.get_images()[-4:]
+                    for frame in frames:
+                        # Reshape frame
+                        np_frame = np.array(frame, dtype=np.uint8)
+                        np_frame = np_frame.reshape(3, 600, 600)
+                        # Cast from RGB to GRAYSCALE
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        self.frames_queue.append(frame)
 
             self.num_timesteps += env.num_envs
             num_collected_steps += 1
