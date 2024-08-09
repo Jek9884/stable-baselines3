@@ -379,7 +379,8 @@ class SACMaster(SAC):
         task_description: str = None,
         tokenizer_str: str = None,
         similarity_thr: float = 0.5,
-        k: int = None
+        k: int = None,
+        indiana: bool = False
     ):
 
         self.device = device
@@ -387,6 +388,7 @@ class SACMaster(SAC):
         self.ae_model = ae_model
         self.task_description = task_description
         self.similarity_thr = similarity_thr
+        self.indiana = indiana
         self.k = k
         self.count = 0
         self.source_policy = None
@@ -719,6 +721,9 @@ class SACMaster(SAC):
             if env_name == "lane-centering-v0":
                 obs_space = spaces.Box(-np.inf, np.inf, (1,9), dtype = np.float32)
 
+            if env_name == "indiana-v0" and self.indiana == True:
+                continue
+
             scheduler = get_schedule_fn(0.1)
             policy = SACPolicy(obs_space, env.action_space, scheduler)
             policy.load_state_dict(th.load(f'{policy_directory}/{file}', map_location=th.device(self.device)))
@@ -726,9 +731,9 @@ class SACMaster(SAC):
             policy_dict[env_name] = policy
 
             env.close()
-
+            
             print(f"{env_name} policy loaded!")
-
+        
         return policy_dict
 
     def _load_source_experience(self, experience_directory, source_descriptions_dir, n_rows=10):
@@ -747,6 +752,9 @@ class SACMaster(SAC):
             name = tokens[0]
 
             env_name = self._get_env_name(name)
+
+            if env_name == "indiana-v0" and self.indiana == True:
+                continue
             env_df = pd.DataFrame(data)
 
             # Get the environment description
